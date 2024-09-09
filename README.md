@@ -5,6 +5,8 @@ This project is my attempt at creating an Asset Backed Security model. The base 
 I intend to continue building my own functionality to further improve this model. 
 
 
+---
+
 This project consists of two major parts: 
 
 - The first is building a loan class which allows us to initialize Loan objects. Through various derived classes, more functionality is added to these loan objects. 
@@ -12,6 +14,7 @@ This project consists of two major parts:
 - The loan folder also includes an Asset base class, which creates Asset objects to initialize any Loan object with. 
 - The Asset derived classes can initialize Car objects, House objects (Vacation or Primary home for example), and I hope to add more Asset types to be initialized into Loan objects in the future.
 
+- - -
 
 - The next major section of the project is the Tranche folder. It creates a base Tranche class, initialized with a notional, a rate, and a subordination tag. 
 - Tranches are ordered by subordination lexicographically for processing payments. 
