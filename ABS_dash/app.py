@@ -14,6 +14,33 @@ from dash import Dash, dcc, html, Input, Output, State, callback, no_update, ctx
 from dash.dependencies import MATCH, ALL, ALLSMALLER
 
 
+# === File Import Processing (imports followed by constants)
+import base64, io, csv, json, datetime as dt
+from collections import deque
+import pandas as pd
+
+# Checks these as valid imported file types
+ALLOWED_EXTS = ('.csv', '.xlsx')
+# Cap number of entries
+MAX_LOG_ENTRIES = 10
+
+# For now, only allowing fixed rate in imported files
+REQUIRED_COLUMNS = [
+    'LoanID',
+    'AssetType',
+    'AssetSubtype',
+    'Face',
+    'Rate',             # Only allowing fixed
+    'TermYears',
+    'IsMortgage'        # True or False, just reading parameter to comply with given loan folder
+]
+
+# For hover bars
+HOVER_SUCCESS = {'status': 'success', 'text': 'Imported loans successfully. '}
+HOVER_PARTIAL = {'status': 'partial', 'text': 'Imported with some row errors. '}
+HOVER_FAIL = {'status': 'fail', 'text': 'Import failed. '}
+
+
 
 # === Waterfall Implementation Imports ===
 # Loan functionality
@@ -28,6 +55,8 @@ from Tranches.waterfall_function import doWaterfall
 from loan.mortgage import VariableMortgage, FixedMortgage
 
 app = Dash(__name__, suppress_callback_exceptions=True)
+
+server = app.server
 
 
 
@@ -82,9 +111,70 @@ def _index_to_label(n: int) -> str:
     return s
 
 
+# --- Preset loader button data (sample 5 loans + 2 tranches) ---
+
+SAMPLE_PRESET = {
+    "mode": "sequential",
+    "loans": [
+        # Fixed mortgage
+        {"asset_type": "house", "asset_subtype": "primary_home",
+         "product": "fixed_mortgage", "face": 300000, "term_years": 30.0, "var_ranges": []},
+
+        # Fixed mortgage
+        {"asset_type": "house", "asset_subtype": "vacation_home",
+         "product": "fixed_mortgage", "face": 200000, "term_years": 30.0, "var_ranges": []},
+
+        # Fixed car
+        {"asset_type": "car", "asset_subtype": "civic",
+         "product": "fixed_rate", "face": 22000, "term_years": 5.0, "var_ranges": []},
+
+        # Fixed car
+        {"asset_type": "car", "asset_subtype": "lexus",
+         "product": "fixed_rate", "face": 28000, "term_years": 5.0, "var_ranges": []},
+
+        # Variable car – two-range example so “Edit Ranges” shows both
+        {"asset_type": "car", "asset_subtype": "toyota",
+         "product": "variable_rate", "face": 18000, "term_years": 5.0,
+         "var_ranges": [
+             {"uid": 1, "start": 1,  "end": 30, "rate": 0.065},
+             {"uid": 2, "start": 31, "end": 60, "rate": 0.072},
+         ]},
+    ],
+    "tranches": [
+        {"label": "A", "notional": 80000, "rate": 0.08},
+        {"label": "B", "notional": 20000, "rate": 0.02},
+    ],
+}
+
+
+
+
+
+
 
 # Function for adding loans button; adds loan trio of type, subtype, loan product
-def make_loan_row(idx: int):
+def make_loan_row(
+        idx: int,
+        *,
+        default_asset_type=None,
+        default_asset_subtype=None,
+        default_product=None,
+        default_face=None,
+        default_term_years=None,
+        default_var_ranges=None,
+):
+
+
+    subtype_opts = []
+    product_opts = []
+    if default_asset_type == "car":
+        subtype_opts = CAR_MODELS
+        product_opts = LOAN_PRODUCTS_CAR
+    elif default_asset_type == "house":
+        subtype_opts = HOUSE_TYPES
+        product_opts = LOAN_PRODUCTS_HOUSE
+
+
     return html.Div(
         [
             # --- Header: dropdown trio + toggle + remove ---
@@ -97,22 +187,27 @@ def make_loan_row(idx: int):
                             {"label": "House", "value": "house"},
                         ],
                         placeholder="Select Asset Type...",
+                        value=default_asset_type,
                         style={"flex": "1"},
                         persistence=True,
                         persistence_type="session"
                     ),
                     dcc.Dropdown(
                         id={"type": "asset-subtype", "index": idx},
-                        options=[], # Will be filled by callback based on asset-type
+                        # options=[], # Will be filled by callback based on asset-type
+                        options = (subtype_opts if default_asset_type else []),
                         placeholder="Select Model / House Type...",
+                        value=default_asset_subtype,
                         style={"flex": "1"},
                         persistence=True,
                         persistence_type="session"
                     ),
                     dcc.Dropdown(
                         id={"type": "loan-product", "index": idx},
-                        options=[], # Will be filled by callback based on asset-type
+                        # options=[], # Will be filled by callback based on asset-type
+                        options=(product_opts if default_asset_type else []),
                         placeholder="Select Loan Product...",
+                        value=default_product,
                         style={"flex": "1"},
                         persistence=True,
                         persistence_type="session"
@@ -150,6 +245,7 @@ def make_loan_row(idx: int):
                                 id={"type": "face", "index": idx},
                                 type="number",
                                 placeholder="Face... (e.g., 200,000)",
+                                value=default_face,
                                 style={"flex": "1", "minWidth": "180px"},
                                 persistence=True,
                                 persistence_type="session"
@@ -158,6 +254,7 @@ def make_loan_row(idx: int):
                                 id={"type": "term", "index": idx},
                                 type="number",
                                 placeholder="Term...",
+                                value=default_term_years,
                                 style={"flex": "1", "minWidth": "160px"},
                                 persistence=True,
                                 persistence_type="session"
@@ -214,7 +311,7 @@ def make_loan_row(idx: int):
                             # Hidden store; holds ranges list
                             dcc.Store(
                                 id={"type": "var-store", "index": idx},
-                                data=[], # List of dicts: [{"uid":1, "start":None, "end":None, "rate":None}, ...]
+                                data=(default_var_ranges or []), # List of dicts: [{"uid":1, "start":None, "end":None, "rate":None}, ...]
                                 storage_type="memory",
                             ),
                         ],
@@ -250,7 +347,13 @@ def make_loan_row(idx: int):
 
 
 # Tranche trio
-def make_tranche_row(idx: int):
+def make_tranche_row(
+        idx: int,
+        *,
+        default_notional=None,
+        default_rate=None,
+        default_label=None,
+):
     default_label = _index_to_label(idx)
     return html.Div(
         [
@@ -262,6 +365,7 @@ def make_tranche_row(idx: int):
                         type="number",
                         # value=0,
                         placeholder="Notional...",
+                        value=default_notional,
                         style={"flex": "1", "minWidth": "160px"},
                         persistence=True,
                         persistence_type="session"
@@ -270,6 +374,7 @@ def make_tranche_row(idx: int):
                         id={"type": "tranche-rate", "index": idx},
                         type="number",
                         placeholder="Rate (decimal)...",
+                        value=default_rate,
                         style={"flex": "1", "minWidth": "160px"},
                         persistence=True,
                         persistence_type="session",
@@ -277,7 +382,7 @@ def make_tranche_row(idx: int):
                     dcc.Input(
                         id={"type": "tranche-label", "index": idx},
                         type="text",
-                        value=default_label,
+                        value=(default_label or _index_to_label(idx)),
                         placeholder="Label... ",
                         style={"flex": "1", "minWidth": "140px"},
                         persistence=True,
@@ -354,6 +459,48 @@ def make_tranche_row(idx: int):
 
 app.layout = html.Div([
 
+    # === Import section stores + Hoverbar ===
+    dcc.Store(id='import-logs', storage_type='local'),
+    dcc.Store(id='last-import-report'),
+    dcc.Store(id='imported-loans-buffer'),
+    dcc.Store(id='import-action-mode'),
+    dcc.Store(id='hoverbar-visible', data=False),
+    dcc.Store(id='hoverbar-payload'),
+    dcc.Store(id='imported-fixed-rates'),
+
+    html.Div(
+        id='hoverbar',
+        style={
+            'position': 'fixed',
+            'bottom': '20%',
+            'right': '24px',
+            'zIndex': 2000,
+            'display': 'none',
+            'padding': '12px 16px',
+            'borderRadius': '8px',
+            'boxShadow': '0 8px 20px rgba(0,0,0,0.25)',
+            'background': '#e8ffe8',
+            'border': '1px solid #b4e3b4',
+            'maxWidth': '420px',
+            'cursor': 'default',
+            'fontSize': '14px'
+        },
+        children=[
+            html.Div(id='hoverbar-text'),
+            html.Div(
+                [
+                    # Opens logs modal (wired into callbacks further down)
+                    html.A('View Import Logs', id='hoverbar-logs-link', href='#',
+                           style={'textDecoration': 'underline', 'marginRight': '16px'}),
+                    html.Span('⏳', id='hoverbar-timer')
+                ],
+                style={'marginTop': '6px', 'display': 'flex', 'alignItems': 'center', 'gap': '10px'}
+            )
+        ]
+    ),
+
+
+
     # TOP STRIP (full width) + adding waterfall button now
     # html.Div([
     #     html.H1("ABS Dashboard"),
@@ -364,8 +511,16 @@ app.layout = html.Div([
     html.Div([
         html.Div([
             html.H1("ABS Dashboard"),
-            html.P("This is a test sentence. Description of how to use site will come here (placeholder)",
-                   style={"margin": "4px 0 0 0"}),
+            # html.P("This is a test sentence. Description of how to use site will come here (placeholder)",
+            #        style={"margin": "4px 0 0 0"}),
+            # html.P("This app simulates cash flow payments received from Loans to pay out investment Tranches.\n "
+            #        "After successful inputs, the user can click the “Run Waterfall” button to display the following "
+            #        "parameters: Interest Due, Interest Paid, any Interest Shortfall, Principal Paid, and remaining "
+            #        "Tranche Balance. This Waterfall continues until the end of all Loans, or until all Tranches have "
+            #        "been paid out in full. ",
+            #                    style={"margin": "4px 0 0 0", "maxWidth": "50%"}),
+            html.P("Work in progress. Will improve aesthetics after fully functional! Coming soon tm.",
+                   style={"margin": "4px 0 0 0", "maxWidth": "100%"}),
         ], style={"display": "flex", "flexDirection": "column"}),
 
         html.Div([
@@ -382,9 +537,109 @@ app.layout = html.Div([
                 },
                 disabled=True, #Enabled by callback
             ),
+            html.Button(
+                "Populate Sample Waterfall",
+                id="btn-populate-sample",
+                n_clicks=0,
+                style={
+                    "height": "44px",
+                    "padding": "0 18px",
+                    "marginLeft": "12px",
+                    "borderRadius": "10px",
+                    "border": "1px solid #343a40",
+                    "backgroundColor": "#343a40",
+                    "color": "white",
+                    "fontWeight": "600"
+                },
+                title="Insert a fixed example (5 loans + 2 tranches)"
+            ),
+            html.Button(
+                'Import from Excel/CSV',
+                id='open-import-modal',
+                n_clicks=0,
+                style={'marginLeft': '8px'}
+            ),
+
             html.Span(id="run-status", style={"marginLeft": "10px", "opacity": 0.7}),
         ], style={"display": "flex", "alignItems": "center"})
     ], style={"padding": "20px", "display": "flex", "justifyContent": "space-between", "alignItems": "center"}),
+
+
+    # Modal import insertion start  -----------------------------
+
+    html.Div(
+        id='import-modal',
+        style={
+            'display': 'none',
+            'position': 'fixed',
+            'top':0, 'left':0, 'right':0, 'bottom':0,
+            'backgroundColor': 'rgba(0,0,0,0.25)',
+            'zIndex': 1500
+        },
+        children=html.Div(
+            style={
+                'position': 'absolute',
+                'top': '50%', 'left': '50%', 'transform': 'translate(-50%, -50%)',
+                'width': 'min(760px, 92vw)',
+                'background': 'white', 'borderRadius': '12px',
+                'padding': '20px 22px', 'boxShadow': '0 12px 28px rgba(0,0,0,0.25)'
+            },
+            children=[
+                html.Div(
+                    style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '10px'},
+                    children=[
+                        html.H3('Import Loans (CSV / XLSX)', style={'margin': 0}),
+                        html.Button('X', id='close-import-modal', n_clicks=0,
+                                    style={'fontSize': '18px', 'border': 'none', 'background': 'transparent', 'cursor': 'pointer'})
+                    ]
+                ),
+                html.P('Upload file to create loans. Fixed rate only. Accepted types: .csv, .xlsx'),
+                # Downloader for sample
+                html.A('~ Download sample file ~', id='download-sample-link', href='#', style={'textDecoration': 'underline'}),
+
+                html.Div(id='import-upload-filelist', style={'fontSize': '12px', 'color': '#555', 'marginTop':'6px'}),
+
+                html.Div(style={'height': '8px'}),
+                dcc.Upload(
+                    id='import-upload',
+                    children=html.Div(['Drag & drop or ', html.Span('Browse files', style={'textDecoration': 'underline'})]),
+                    style={
+                        'width': '100%', 'height': '120px', 'lineHeight': '120px',
+                        'borderWidth': '2px', 'borderStyle': 'dashed', 'borderRadius': '8px',
+                        'textAlign': 'center', 'background': '#fafafa'
+                    },
+                    multiple=True,
+                    accept='.csv, .xlsx'
+                ),
+                html.Div(style={'height': '8px'}),
+                html.Div([
+                    html.Label('Action:'),
+                    dcc.RadioItems(
+                        id='import-action',
+                        options=[
+                            {'label': 'Replace current loans', 'value': 'replace'},
+                            {'label': 'Append to existing loans', 'value': 'append'}
+                        ],
+                        value='replace',
+                        labelStyle={'display': 'block', 'margin': '4px 0'}
+                    ),
+                    html.Div(
+                        'This will replace current loans.',
+                        id='import-replace-warning',
+                        style={'color': '#a33', 'fontSize': '12px', 'marginTop': '4px', 'display': 'block'}
+                    )
+                ], style={'marginTop': '10px'}),
+                html.Div(id='import-inline-error', style={'color': '#a33', 'fontSize': '12px', 'marginTop': '8px', 'minHeight': '16px'}),
+                html.Div(style={'display': 'flex', 'justifyContent': 'flex-end', 'gap': '8px', 'marginTop': '14px'}, children=[
+                    html.Button('Cancel', id='cancel-import', n_clicks=0),
+                    html.Button('Confirm Import', id='confirm-import', n_clicks=0,
+                                style={'background': '#0b6', 'color': 'white', 'border': 'none', 'padding': '8px 12px', 'borderRadius': '6px'})
+                ])
+            ]
+        )
+    ),
+
+    # Modal import insertion end    -----------------------------
 
 
     # Stores for pass-through (inputs snapshot/computed results)
@@ -395,6 +650,36 @@ app.layout = html.Div([
 
     # HORIZONTAL LINE DIVIDER
     html.Hr(style = {"border": "1px solid black", "margin": 0}),
+
+    # View import logs link
+    html.Div(
+        [html.A('View Import Logs', id='open-logs-modal', href='#', style={'textDecoration': 'underline'})],
+        style={'padding': '8px 20px'}
+    ),
+
+    # Logs modal
+    html.Div(
+        id='logs-modal',
+        style={'display': 'none', 'position': 'fixed', 'top': 0, 'left': 0, 'right': 0, 'bottom': 0,
+               'backgroundColor': 'rgba(0,0,0,0.5)', 'zIndex': 1500},
+        children=html.Div(
+            style={'position': 'absolute', 'top': '50%', 'left': '50%', 'transform': 'translate(-50%, -50%)',
+                   'width': 'min(820px, 94vw)', 'background': 'white', 'borderRadius': '12px', 'padding': '18px 20px'},
+            children=[
+                html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '8px'},
+                         children=[html.H3('Import Logs', style={'margin': 0}),
+                                   html.Button('X', id='close-logs-modal', n_clicks=0,
+                                               style={'fontSize': '18px', 'border': 'none', 'background': 'transparent', 'cursor': 'pointer'})]),
+                html.Div(id='logs-list', style={'maxHeight': '60vh', 'overflowY': 'auto'}),
+            ]
+        )
+    ),
+
+    # Download components
+    dcc.Download(id='download-import-report'),
+    dcc.Download(id='download-sample-csv'),
+
+
 
 
     html.Div([
@@ -573,7 +858,18 @@ def remove_loan_this_row(n_clicks, style):
 
 
 
-
+# Import section callback to display selected file names (stack nicely above browse area)
+@callback(
+    Output('import-upload-filelist', 'children'),
+    Input('import-upload', 'filename')
+)
+def show_selected_filenames(names):
+    if not names:
+        return ''
+    if isinstance(names, str):
+        names = [names]
+    return html.Ul([html.Li(n) for n in names],
+                   style={'paddingLeft': '18px', 'margin': '6px 0'})
 
 
 
@@ -1053,6 +1349,52 @@ def warn_zero_notional(val, cur_style):
 
 
 
+
+# =========== SAMPLE BUTTON CALLBACKS ===========
+@callback(
+    Output("loan-rows", "children"),
+    Output("tranche-rows", "children"),
+    Output("global-mode", "value"),
+    Input("btn-populate-sample", "n_clicks"),
+    prevent_initial_call=True,
+)
+def populate_sample(n_clicks):
+    if not n_clicks:
+        return no_update, no_update, no_update
+
+    # Build loan rows from preset (index from 1)
+    loan_children = []
+    for i, L in enumerate(SAMPLE_PRESET["loans"], start=1):
+        loan_children.append(
+            make_loan_row(
+                i,
+                default_asset_type=L.get("asset_type"),
+                default_asset_subtype=L.get("asset_subtype"),
+                default_product=L.get("product"),
+                default_face=L.get("face"),
+                default_term_years=L.get("term_years"),
+                default_var_ranges=L.get("var_ranges")
+            )
+        )
+
+    # Build tranche rows from preset (index from 1)
+    tranche_children = []
+    for j, T in enumerate(SAMPLE_PRESET["tranches"], start=1):
+        tranche_children.append(
+            make_tranche_row(
+                j,
+                default_notional=T.get("notional"),
+                default_rate=T.get("rate"),
+                default_label=T.get("label")
+            )
+        )
+
+
+    # Return both
+    return loan_children, tranche_children, SAMPLE_PRESET["mode"]
+
+
+
 # =========== LOAN BUILDERS ===========
 
 def _is_visible(style_dict):
@@ -1361,7 +1703,7 @@ def _build_and_run(
 
 
     if not loans:
-        return dash.no_update, dash.no_update
+        return no_update, no_update
 
 
     lp = LoanPool(loans)
@@ -1394,7 +1736,7 @@ def _build_and_run(
         t_rows.append({"label": str(label), "notional": nt_val, "rate": rt_val, "row_index": j})
 
     if not t_rows:
-        return dash.no_update, dash.no_update
+        return no_update, no_update
 
 
     # Handle notionals --> required rate formats (see structured_securities_class.py: addTranche)
@@ -1553,6 +1895,595 @@ def _render_results_table(data):
         html.H3("Waterfall Results", style={"marginTop": "0"}),
         table
     ]
+
+
+
+
+# Parsing and validation helpers for excel imports
+def _read_uploaded_file(contents: str, filename: str):
+    # Return pandas df or raise error
+    if not filename:
+        raise ValueError("No filename provided. ")
+    lower = filename.lower()
+    if not lower.endswith(ALLOWED_EXTS):
+        raise ValueError("Unsupported file type. Upload csv or xlsx.")
+
+    try:
+        content_type, content_string = contents.split(',')
+    except Exception:
+        raise ValueError("Invalid upload. ")
+
+    decoded = base64.b64decode(content_string)
+
+
+    try:
+        if lower.endswith('.csv'):
+            return pd.read_csv(io.BytesIO(decoded))
+        else:
+            return pd.read_excel(io.BytesIO(decoded), engine='openpyxl')
+    except Exception as ex:
+        raise ValueError(f"Could not parse file: {ex}")
+
+def _coerce_bool(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)) and x in (0,1):
+        return bool(int(x))
+    if isinstance(x, str):
+        v = x.strip().lower()
+        if v in ('true', 't', 'yes', 'y', '1'): return True
+        if v in ('false', 'f', 'no', 'n', '0'): return False
+
+    raise ValueError("Must be TRUE/FALSE")
+
+
+
+# Actually sets it up to pump into "manual" zone
+# Returns valid_rows, errors, assigned IDs to objects
+def _validate_and_normalize(df: pd.DataFrame):
+    errors = []
+    valid_rows = []
+
+    # Basic column check; lenient with LoanID --> auto assign if problem
+    required_missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    # If any missing, cooked
+    if required_missing:
+        errors.append({'RowNumber': 0, 'Field': 'Header', 'Value': '',
+                       'ErrorMessage': f"Missing required columns: {', '.join(required_missing)}"})
+        return [], errors, set()
+
+    # Asset subtype maps
+    HOUSE_SUBTYPES = {'PrimaryHome', 'VacationHome'}
+    CAR_SUBTYPES = {'Civic', 'Lexus', 'Lambo', 'Toyota', 'Ferrari', 'Other'}
+
+
+    # Missing LoanID allowed
+    assigned_ids = set()
+    auto_counter = 1
+
+
+    for i, row in df.iterrows():
+        rownum = i + 2 # start 1 + header --> push up by 2 (errors should show user-oriented row num)
+        try:
+            loan_id = str(row['LoanID']).strip() if pd.notna(row['LoanID']) else ''
+            if not loan_id or loan_id.lower() == 'nan':
+                while str(auto_counter) in assigned_ids:
+                    auto_counter += 1
+                loan_id = str(auto_counter)
+                auto_counter += 1
+            if loan_id in assigned_ids:
+                raise ValueError(f"Duplicate LoanID in file")
+            assigned_ids.add(loan_id)
+
+            asset_type = str(row['AssetType']).strip()
+            if asset_type not in ('House', 'Car'):
+                raise ValueError("AssetType must be 'House' or 'Car'")
+
+
+            asset_subtype = str(row['AssetSubtype']).strip()
+            if asset_type == 'House' and asset_subtype not in HOUSE_SUBTYPES:
+                raise ValueError(f"AssetSubtype '{asset_subtype}' not allowed for Asset Type 'House'")
+            if asset_type == 'Car' and asset_subtype not in CAR_SUBTYPES:
+                raise ValueError(f"AssetSubtype '{asset_subtype}' not allowed for Asset Type 'Car'")
+
+            face = float(row['Face'])
+            if not (face > 0):
+                raise ValueError("Face must be > 0 ")
+
+            rate = float(row['Rate'])
+            if rate < 0:
+                raise ValueError("Rate must not be negative")
+
+            term_years = int(row['TermYears'])
+            if term_years < 1:
+                raise ValueError("TermYears must be an integer 1 or greater")
+
+
+            is_mortgage = _coerce_bool(row['IsMortgage'])
+
+            if asset_type == 'House' and not is_mortgage:
+                raise ValueError(f"House loans must be mortgages in import (loan folder asset type compatibility). ")
+
+            # Normalize to pump into UI (manual section)
+            valid_rows.append({
+                'LoanID': loan_id,
+                'AssetType': asset_type,
+                'AssetSubtype': asset_subtype,
+                'Face': face,
+                'Rate': rate,
+                'TermYears': term_years,
+                'IsMortgage': is_mortgage
+            })
+
+        except Exception as ex:
+            # Tries to attach error after capturing offending field/value
+            errors.append({
+                'RowNumber': rownum,
+                'Field': 'Row',
+                'Value': '',
+                'ErrorMessage': str(ex)
+            })
+
+    return valid_rows, errors, assigned_ids
+
+
+
+# Import log report builder
+def _build_report_csv_rows(errors):
+    rows = []
+    for ex in errors:
+        rows.append({
+            'RowNumber': ex.get('RowNumber', ''),
+            'Field': ex.get('Field', ''),
+            'Value': ex.get('Value', ''),
+            'ErrorMessage': ex.get('ErrorMessage', '')
+        })
+    return rows
+
+# Bookkeeping function: method to pack everything
+def _append_log_entry(existing_logs, *, filename, action, outcome, imported_count, failed_count, timestamp=None, has_report = False):
+    if timestamp is None:
+        timestamp = dt.datetime.now().strftime('%b %d, %I:%M %p')
+    entry = {
+        'timestamp': timestamp,
+        'filename': filename,
+        'action': action,
+        'outcome': outcome,
+        'imported_count': imported_count,
+        'failed_count': failed_count,
+        'has_report': has_report
+    }
+    dq = deque(existing_logs or [])
+    dq.appendleft(entry)
+    while len(dq) > MAX_LOG_ENTRIES:
+        dq.pop()
+
+    return list(dq)
+
+
+# Mapping helper: CSV row --> UI
+def _map_import_to_ui_defaults(row_dict):
+    asset_type = row_dict['AssetType']
+    subtype =    row_dict['AssetSubtype']
+    face =       row_dict['Face']
+    rate =       row_dict['Rate']
+    term =       row_dict['TermYears']
+    is_mort =    row_dict['IsMortgage']
+
+    # Asset type --> UI val
+    ui_asset_type = 'house' if asset_type == 'House' else 'car'
+
+    # Subtype --> UI
+    if ui_asset_type == 'house':
+        SUBMAP_HOUSE = {
+            'PrimaryHome': 'primary_home',
+            'VacationHome': 'vacation_home'
+        }
+        ui_subtype = SUBMAP_HOUSE.get(subtype, 'primary_home') # default primary
+        ui_product = 'fixed_mortgage'
+    else:
+        SUBMAP_CARS = {
+            'Civic': 'civic',
+            'Lexus': 'lexus',
+            'Toyota': 'toyota',
+            'Ferrari': 'ferrari',
+            'Other': 'car_other'
+        }
+        ui_subtype = SUBMAP_CARS.get(subtype, 'car_other')
+        ui_product = 'fixed_rate'
+
+    return {
+        'default_asset_type': ui_asset_type,
+        'default_asset_subtype': ui_subtype,
+        'default_product': ui_product,
+        'default_face': face,
+        'default_term_years': term,
+        'fixed_rate_to_apply': rate #see below (new callback for this - apply_import_to_ui)
+    }
+
+
+
+
+
+
+
+# =========== Import Callbacks ===========
+
+# Toggle import modal
+@app.callback(
+    Output('import-modal', 'style'),
+    Input('open-import-modal', 'n_clicks'),
+    Input('close-import-modal', 'n_clicks'),
+    Input('cancel-import', 'n_clicks'),
+    prevent_initial_call=True
+)
+def toggle_import_modal(open_clicks, close_clicks, cancel_clicks):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return no_update
+    trig = ctx.triggered[0]['prop_id'].split('.')[0]
+    if trig == 'open-import-modal':
+        return {'display': 'block', 'position':'fixed', 'top':0, 'right':0, 'left':0, 'bottom':0,
+                'backgroundColor': 'rgba(0,0,0,0.5)', 'zIndex':1500}
+    else:
+        return {'display': 'none'}
+
+
+# Replace warning visibility
+@app.callback(
+    Output('import-replace-warning', 'style'),
+    Input('import-action', 'value')
+)
+def show_replace_warning(action):
+    return {'color': '#a33', 'fontSize': '12px', 'marginTop': '4px', 'display': 'block'} if action == 'replace' else {'display': 'none'}
+
+
+
+# Confirm import --> parse "manually" + validate, set buffers, show hover, update logs
+@app.callback(
+    [
+        Output('import-modal', 'style', allow_duplicate=True),  # close or stay
+        Output('import-inline-error', 'children'),              # inline error in modal if total fail
+        Output('hoverbar-visible', 'data'),                     # show hover
+        Output('hoverbar-payload', 'data'),                     # status + message for hover
+        Output('import-logs', 'data'),                          # append log entry
+        Output('last-import-report', 'data'),                   # save report (list of dicts) or None
+        Output('imported-loans-buffer', 'data'),                # normalized good rows
+        Output('import-action-mode', 'data')                    # 'replace'|'append'
+    ],
+    Input('confirm-import', 'n_clicks'),
+    State('import-upload', 'contents'),
+    State('import-upload', 'filename'),
+    State('import-action', 'value'),
+    State('import-logs', 'data'),
+    prevent_initial_call=True
+)
+
+def handle_confirm_import(n_confirm, contents, filename, action, logs):
+    if not contents or not filename:
+        # i.e. no file
+        payload = {'status': 'fail', 'message': 'No file. Import valid csv or xlsx. '}
+        logs = _append_log_entry(logs, filename=filename or '(none)', action=action, outcome='fail',
+                                 imported_count=0, failed_count=0, has_report=False)
+        return no_update, 'Select a file before importing ', True, payload, logs, None, None, action
+
+
+    if isinstance(contents, str):
+        contents = [contents]
+    if isinstance(filename, str):
+        filename = [filename]
+
+    # Merge valid files into df
+    dfs = []
+    read_errors = []
+    for c, f in zip(contents, filename):
+        lower = (f or '').lower()
+        if not lower.endswith(ALLOWED_EXTS):
+            read_errors.append({'RowNumber': 0, 'Field': 'File', 'Value': f, 'ErrorMessage': 'Unsupported file type'})
+            continue
+        try:
+            dfs.append(_read_uploaded_file(c, f))
+        except ValueError as ex:
+            read_errors.append({'RowNumber': 0, 'Field': 'File', 'Value': f, 'ErrorMessage': str(ex)})
+
+    if not dfs:
+        # Total failure reading
+        payload = {'status': 'fail', 'message': 'Import failed, no readable CSV/XLSX'}
+        logs = _append_log_entry(
+            logs,
+            filename=', '.join(filename) if filename else '(none)',
+            action=action, outcome='fail', imported_count=0,
+            failed_count=len(read_errors), has_report=True
+        )
+        report = _build_report_csv_rows(read_errors)
+        return no_update, 'No readable files found, see Import Logs', True, payload, logs, report, None, action
+
+    # Concatenate  + validate rows together
+    try:
+        df_all = pd.concat(dfs, ignore_index=True)
+    except Exception as ex:
+        payload = {'status': 'fail', 'message': f'Import failed: {ex}'}
+        logs = _append_log_entry(
+            logs, filename=", ".join(filename),
+            action=action, outcome='fail', imported_count=0,
+            failed_count=1, has_report=True
+        )
+        report = _build_report_csv_rows([{'RowNumber': 0, 'Field': 'Concat', 'Value': '', 'ErrorMessage': str(ex)}])
+        return no_update, 'Could not merge files, see Import Logs', True, payload, logs, report, None, action
+
+    valid_rows, row_errors, _ = _validate_and_normalize(df_all)
+    errors = (read_errors or []) + (row_errors or [])
+
+
+    ### Erm marker; replaced with above
+    # lower = filename.lower()
+    # if not lower.endswith(ALLOWED_EXTS):
+    #     payload = {'status': 'fail', 'message': 'Unsupported file type.'}
+    #     logs = _append_log_entry(logs, filename=filename, action=action, outcome='type', imported_count=0, failed_count=0, has_report=False)
+    #     return no_update, 'Unsupported file type', True, payload, logs, None, None, action
+    #
+    # try:
+    #     df = _read_uploaded_file(contents, filename)
+    #     valid_rows, errors, _ = _validate_and_normalize(df)
+    #
+    # except ValueError as ex:
+    #     payload = {'status': 'fail', 'message': f'Import failed: {ex}'}
+    #     logs = _append_log_entry(logs, filename=filename, action=action, outcome='fail', imported_count=0, failed_count=0, has_report=True)
+    #     report = _build_report_csv_rows([{'RowNumber':0, 'Field':'File', 'Value':'', 'ErrorMessage': str(ex)}])
+    #     # Keep modal open for retry; show inline error + hoverbar
+    #     return no_update, str(ex), True, payload, logs, report, None, action
+
+
+    imported_count = len(valid_rows)
+    failed_count = len(errors)
+    if imported_count == 0:
+        # total failure --> keep open, inline error
+        payload = {'status': 'fail', 'message': 'No valid rows found'}
+        logs = _append_log_entry(logs, filename=filename, action=action, outcome='fail', imported_count=0, failed_count=failed_count, has_report=True)
+        report = _build_report_csv_rows(errors)
+        return no_update, 'No valid rows found. See Import Logs for details. ', True, payload, logs, report, None, action
+
+
+    # Success or partial --> close modal, hover, log, stash report if any
+    outcome = 'success' if failed_count == 0 else 'partial'
+
+    payload = {'status': outcome, 'message': f'Imported {imported_count} loans.' + ('' if failed_count==0 else f' {failed_count} rows failed')}
+    # logs = _append_log_entry(logs, filename=filename, action=action, outcome=outcome, imported_count=imported_count, failed_count=failed_count, has_report=(failed_count>0))
+    logs = _append_log_entry(
+        logs,
+        filename=(", ".join(filename) if isinstance(filename, list) else (filename or '(none)')),
+        action=action, outcome=outcome,
+        imported_count=imported_count, failed_count=failed_count,
+        has_report=(failed_count>0)
+    )
+
+    report = _build_report_csv_rows(errors) if failed_count > 0 else None
+
+    # Close modal, clear error, hover visible, fill buffers
+    return{'display': 'none'}, '', True, payload, logs, report, valid_rows, action
+
+
+
+
+
+# Imported loans to UI rows
+@callback(
+    Output("loan-rows", "children", allow_duplicate=True),
+    Output("imported-fixed-rates", "data"),
+    Input("imported-loans-buffer", "data"),
+    State("import-action-mode", "data"),
+    State("loan-rows", "children"),
+    prevent_initial_call=True
+)
+def apply_import_to_ui(buffer, action_mode, existing_children):
+    # Action mode is replace or append; returns list of (row_index, fixed_rate) pairs to set rates
+    if not buffer:
+        raise dash.exceptions.PreventUpdate
+
+    children = [] if action_mode == 'replace' else list(existing_children or [])
+
+    # Get next index helper
+    def next_index(items):
+        if not items:
+            return 1
+        indices = []
+        for c in items:
+            cid = (c.get("props", {}).get("id") if isinstance(c, dict) else getattr(c, "id", None))
+            if isinstance(cid, dict) and isinstance(cid.get("index"), int):
+                indices.append(cid["index"])
+        return (max(indices) + 1) if indices else 1
+
+    # Build rows + record (index, fixed_rate)
+    fixed_pairs = []
+
+    for row in buffer:
+        defaults = _map_import_to_ui_defaults(row)
+        idx = next_index(children)
+        children.append(
+            make_loan_row(
+                idx,
+                default_asset_type=defaults['default_asset_type'],
+                default_asset_subtype=defaults['default_asset_subtype'],
+                default_product=defaults['default_product'],
+                default_face=defaults['default_face'],
+                default_term_years=defaults['default_term_years'],
+                default_var_ranges=[] #fixed only
+            )
+        )
+        fixed_pairs.append((idx, defaults['fixed_rate_to_apply']))
+
+    return children, fixed_pairs
+
+
+
+# Set fixed-rate inputs for imported rows
+@callback(
+    Output({'type': 'fixed-rate', "index": ALL}, 'value'),
+    Input('imported-fixed-rates', 'data'),
+    Input({'type': 'fixed-rate', 'index': ALL}, 'id'),
+    State({'type': 'fixed-rate', 'index': ALL}, 'value'),
+    prevent_initial_call=True
+)
+def set_fixed_rates_for_import(fixed_pairs, all_ids, current_value):
+    # fixed_pairs = [(index1, fixed_rate1), ...] from prev callback
+    if not fixed_pairs or not all_ids:
+        raise dash.exceptions.PreventUpdate
+
+    # Build map: index --> rate
+    idx_to_rate = {idx: rate for idx, rate in (fixed_pairs or [])}
+
+    # Clone current vals, overlay where matches
+    values = list(current_value or [])
+
+    # Ensure output length matches number of inputs
+    if len(values) != len(all_ids):
+        values = [None] * len(all_ids)
+
+    for pos, cid in enumerate(all_ids):
+        try:
+            row_index = cid.get("index")
+            if row_index in idx_to_rate:
+                values[pos] = idx_to_rate[row_index]
+        except Exception:
+            # If can't parse, leave as is
+            pass
+
+    return values
+
+
+
+
+
+
+
+# Hover bar display + style + auto-dismiss mechanics
+@app.callback(
+    [Output('hoverbar', 'style'), Output('hoverbar-text', 'children')],
+    [Input('hoverbar-visible', 'data'), Input('hoverbar-payload', 'data')]
+)
+def render_hoverbar(visible, payload):
+    base = {
+        'position': 'fixed', 'bottom': '20%', 'right': '24px', 'zIndex':2000,
+        'padding': '12px 16px', 'borderRadius': '8px', 'boxShadow': '0 8px 20px rgba(0,0,0,0.25)',
+        'display': 'none', 'maxWidth':'420px', 'cursor':'default', 'fontSize':'14px'
+    }
+    if not visible or not payload:
+        return base, ''
+    status = payload.get('status', 'success')
+    message = payload.get('message', '')
+
+    if status == 'success':
+        base.update({'display': 'block', 'background': '#e8ffe8', 'border': '1px solid #b4e3b4'})
+        icon = '✅ '
+    elif status == 'partial':
+        base.update({'display': 'block', 'background': '#fffbe6', 'border': '1px solid #ebdd9f'})
+        icon = '🟠 '
+    else:
+        base.update({'display': 'block', 'background': '#ffe8e8', 'border': '1px solid #e3b4b4'})
+        icon = '❌ '
+
+    # Include "View Import Logs"
+    text = f"{icon}{message}  "
+    return base, text
+
+
+
+# === Clicking either of the "View Import Logs" links opens modal and stops hover
+@app.callback(
+    [Output('logs-modal', 'style'), Output('hoverbar-visible', 'data', allow_duplicate=True)],
+    [Input('open-logs-modal', 'n_clicks'), Input('hoverbar-logs-link', 'n_clicks'), Input('close-logs-modal', 'n_clicks')],
+    prevent_initial_call=True
+)
+def toggle_logs_modal(open_clicks_main, open_clicks_hover, close_clicks):
+    _ctx = ctx
+    if not _ctx.triggered:
+        return no_update, no_update
+    trig = ctx.triggered[0]['prop_id'].split('.')[0]
+
+    if trig in ('open-logs-modal', 'hoverbar-logs-link'):
+        return {'display': 'block', 'position':'fixed', 'top':0, 'left':0, 'right':0, 'bottom': 0, 'backgroundColor': 'rgba(0,0,0,0.5)', 'zIndex': 1500}, False
+    else:
+        return {'display': 'none'}, False
+
+
+# Render logs list
+@app.callback(
+    Output('logs-list', 'children'),
+    Input('import-logs', 'data'),
+    State('last-import-report', 'data')
+)
+def render_logs(logs, last_report):
+    if not logs:
+        return html.Div('No imports yet', style={'color': '#555'})
+    items = []
+    for idx, log in enumerate(logs):
+        line = html.Details([
+            html.Summary(
+                f"[{log['timestamp']}] {log['filename']} - {log['action'].capitalize()} - "
+                f"{'✅ Success' if log['outcome']=='success' else ('🟠 Partial' if log['outcome']=='partial' else '❌ Fail')} - "
+                f"{log['imported_count']} imported, {log['failed_count']} failed"
+            ),
+            html.Div([
+                html.P('All rows imported successfully' if (log['failed_count']==0 and log['outcome']=='success')
+                       else f"Failed rows present. Download Import Report for details.")
+            ], style={'marginLeft': '12px'}),
+            html.Div([
+                html.Button('Download Import Report (.csv)', id={'type': 'download-report-btn', 'index': idx}, n_clicks=0,
+                            style={'display': 'inline-block' if log.get('has_report') else 'none'})
+            ], style={'marginLeft': '12px', 'marginBottom': '8px'})
+        ], open=False, style={'margin': '6px 0'})
+        items.append(line)
+
+    return items
+
+
+
+
+
+
+@app.callback(
+    Output('download-import-report', 'data'),
+    Input({'type': 'download-report-btn', 'index': ALL}, 'n_clicks'),
+    State('last-import-report', 'data'),
+    prevent_initial_call=True
+)
+def download_import_report(n_clicks_list, report_rows):
+    if not n_clicks_list or not any(n_clicks_list) or not report_rows:
+        return no_update
+    # Build csv in memory
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=['RowNumber', 'Field', 'Value', 'ErrorMessage'])
+    writer.writeheader()
+    for r in report_rows:
+        writer.writerow(r)
+    content = output.getvalue()
+    output.close()
+    timestamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+    return dict(content=content, filename=f"import_report_{timestamp}.csv")
+
+
+@app.callback(
+    Output('download-sample-csv', 'data'),
+    Input('download-sample-link', 'n_clicks'),
+    prevent_initial_call=True
+)
+def download_sample_csv(n):
+    if not n:
+        return no_update
+    # Read local csv
+    try:
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "ABS_loans_template.csv")
+        with open(path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return dict(content=content, filename="ABS_loans_template.csv")
+    except Exception as ex:
+        return no_update
+
+
+
+
 
 
 
