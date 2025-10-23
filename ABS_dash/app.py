@@ -118,19 +118,19 @@ SAMPLE_PRESET = {
     "loans": [
         # Fixed mortgage
         {"asset_type": "house", "asset_subtype": "primary_home",
-         "product": "fixed_mortgage", "face": 300000, "term_years": 30.0, "var_ranges": []},
+         "product": "fixed_mortgage", "face": 300000, "term_years": 30.0, "fixed_rate": 0.06, "var_ranges": []},
 
         # Fixed mortgage
         {"asset_type": "house", "asset_subtype": "vacation_home",
-         "product": "fixed_mortgage", "face": 200000, "term_years": 30.0, "var_ranges": []},
+         "product": "fixed_mortgage", "face": 200000, "term_years": 30.0, "fixed_rate": 0.058, "var_ranges": []},
 
         # Fixed car
         {"asset_type": "car", "asset_subtype": "civic",
-         "product": "fixed_rate", "face": 22000, "term_years": 5.0, "var_ranges": []},
+         "product": "fixed_rate", "face": 22000, "term_years": 5.0, "fixed_rate": 0.069, "var_ranges": []},
 
         # Fixed car
         {"asset_type": "car", "asset_subtype": "lexus",
-         "product": "fixed_rate", "face": 28000, "term_years": 5.0, "var_ranges": []},
+         "product": "fixed_rate", "face": 28000, "term_years": 5.0, "fixed_rate": 0.072, "var_ranges": []},
 
         # Variable car – two-range example so “Edit Ranges” shows both
         {"asset_type": "car", "asset_subtype": "toyota",
@@ -141,8 +141,8 @@ SAMPLE_PRESET = {
          ]},
     ],
     "tranches": [
-        {"label": "A", "notional": 80000, "rate": 0.08},
-        {"label": "B", "notional": 20000, "rate": 0.02},
+        {"label": "A", "notional": 8000, "rate": 0.08},
+        {"label": "B", "notional": 2000, "rate": 0.02},
     ],
 }
 
@@ -467,6 +467,13 @@ app.layout = html.Div([
     dcc.Store(id='hoverbar-visible', data=False),
     dcc.Store(id='hoverbar-payload'),
     dcc.Store(id='imported-fixed-rates'),
+    # --- Swaps on imports ---
+    dcc.Store(id='imported-row-indices'),
+    dcc.Store(id='bounce-back-needed', data=False),
+    # -- Swaps for PSW ---
+    dcc.Store(id='psw-row-indices'),
+    dcc.Store(id='psw-bounce-flag', data=False),
+    dcc.Store(id='psw-fixed-rates'),
 
     html.Div(
         id='hoverbar',
@@ -1355,16 +1362,25 @@ def warn_zero_notional(val, cur_style):
     Output("loan-rows", "children"),
     Output("tranche-rows", "children"),
     Output("global-mode", "value"),
+    Output("psw-row-indices", "data"),
+    Output("psw-bounce-flag", "data"),
+    Output("psw-fixed-rates", "data"),
     Input("btn-populate-sample", "n_clicks"),
     prevent_initial_call=True,
 )
 def populate_sample(n_clicks):
     if not n_clicks:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update, no_update
 
     # Build loan rows from preset (index from 1)
     loan_children = []
+    fixed_indices = []
+    fixed_pairs = []    # list of (row_index, fixed_rate)
+
+
     for i, L in enumerate(SAMPLE_PRESET["loans"], start=1):
+        # Record fixed rows to bounce rate area to force boxes
+        prod = (L.get("product") or "").lower()
         loan_children.append(
             make_loan_row(
                 i,
@@ -1376,6 +1392,13 @@ def populate_sample(n_clicks):
                 default_var_ranges=L.get("var_ranges")
             )
         )
+        # # Record fixed rows to bounce rate area to force boxes
+        # prod = str(L.get("product") or "").lower()
+        if "variable" not in prod:
+            fixed_indices.append(i)
+            fr = L.get("fixed_rate")
+            if fr is not None:
+                fixed_pairs.append((i, fr))
 
     # Build tranche rows from preset (index from 1)
     tranche_children = []
@@ -1391,7 +1414,12 @@ def populate_sample(n_clicks):
 
 
     # Return both
-    return loan_children, tranche_children, SAMPLE_PRESET["mode"]
+    return (
+        loan_children, tranche_children, SAMPLE_PRESET["mode"],
+        fixed_indices, # psw-row-indices
+        True,           # psw-bounce-flag --> ask kick/bounce to run
+        fixed_pairs
+    )
 
 
 
@@ -1593,7 +1621,7 @@ def _toggle_run_button(
             break
 
     if not any_valid_loan:
-        return True, "Complete at least one visible loan (face, term, rate). "
+        return True, "Complete at least one visible loan. "
 
 
 
@@ -2270,6 +2298,8 @@ def handle_confirm_import(n_confirm, contents, filename, action, logs):
 @callback(
     Output("loan-rows", "children", allow_duplicate=True),
     Output("imported-fixed-rates", "data"),
+    Output("imported-row-indices", "data"),
+    Output("bounce-back-needed", "data"),
     Input("imported-loans-buffer", "data"),
     State("import-action-mode", "data"),
     State("loan-rows", "children"),
@@ -2295,6 +2325,9 @@ def apply_import_to_ui(buffer, action_mode, existing_children):
 
     # Build rows + record (index, fixed_rate)
     fixed_pairs = []
+    # Track imported loans
+    imported_indices = []
+
 
     for row in buffer:
         defaults = _map_import_to_ui_defaults(row)
@@ -2311,44 +2344,231 @@ def apply_import_to_ui(buffer, action_mode, existing_children):
             )
         )
         fixed_pairs.append((idx, defaults['fixed_rate_to_apply']))
+        # Record index for bounce
+        imported_indices.append(idx)
 
-    return children, fixed_pairs
+    return children, fixed_pairs, imported_indices, True
 
 
-
-# Set fixed-rate inputs for imported rows
+# --- First kick callback ---
 @callback(
-    Output({'type': 'fixed-rate', "index": ALL}, 'value'),
+    Output({'type': 'loan-product', 'index': ALL}, 'value', allow_duplicate=True),
+    Output('bounce-back-needed', 'data', allow_duplicate=True),
+    Input('imported-row-indices', 'data'),
+    State({'type': 'loan-product', 'index': ALL}, 'id'),
+    State({'type': 'loan-product', 'index': ALL}, 'value'),
+    State({'type': 'asset-type', 'index': ALL}, 'value'),
+    prevent_initial_call=True
+)
+def _kick_products_to_variable(imported_indices, all_ids, current_products, asset_types):
+    # If no new rows, do nothing
+    if not imported_indices or not all_ids:
+        raise dash.exceptions.PreventUpdate
+
+    # Normalize lists
+    products = list(current_products or [])
+    if len(products) != len(all_ids):
+        products = [None] * len(all_ids)
+
+    imported_set = set(imported_indices)
+
+    # For each row, if among new rows, flip to var based on asset type
+    for pos, cid in enumerate(all_ids):
+        try:
+            idx = cid.get('index')
+            if idx in imported_set:
+                at = (asset_types[pos] if pos < len(asset_types) else None)
+                if at == 'house':
+                    products[pos] = 'variable_mortgage'
+                else:
+                    products[pos] = 'variable_rate'
+        except Exception:
+            pass
+
+
+    # Signal that must bounce back to fixed
+    return products, True
+
+
+# --- Second kick callback ---
+@callback(
+    Output({'type': 'loan-product', 'index': ALL}, 'value', allow_duplicate=True),
+    Output('bounce-back-needed', 'data', allow_duplicate=True),
+    Input('bounce-back-needed', 'data'),
+    State('imported-row-indices', 'data'),
+    State({'type': 'loan-product', 'index': ALL}, 'id'),
+    State({'type': 'loan-product', 'index': ALL}, 'value'),
+    State({'type': 'asset-type', 'index': ALL}, 'value'),
+    prevent_initial_call=True
+)
+def _bounce_back_to_fixed(need_bounce, imported_indices, all_ids, current_products, asset_types):
+    if not need_bounce:
+        raise dash.exceptions.PreventUpdate
+    if not imported_indices or not all_ids:
+        raise dash.exceptions.PreventUpdate
+
+    products = list(current_products or [])
+    if len (products) != len(all_ids):
+        products = [None] * len(all_ids)
+
+    imported_set = set(imported_indices)
+
+    for pos, cid in enumerate(all_ids):
+        try:
+            idx = cid.get('index')
+            if idx in imported_set:
+                at = (asset_types[pos] if pos < len(asset_types) else None)
+                if at == 'house':
+                    products[pos] = 'fixed_mortgage'
+                else:
+                    products[pos] = 'fixed_rate'
+        except Exception as ex:
+            pass
+
+    # Reset bounce flag
+    return products, False
+
+
+
+
+
+
+# Set fixed-rate inputs for both Imports and PSW (unified to avoid overlapping Outputs)
+@callback(
+    Output({'type': 'fixed-rate', 'index': ALL}, 'value'),
     Input('imported-fixed-rates', 'data'),
-    Input({'type': 'fixed-rate', 'index': ALL}, 'id'),
+    Input('psw-fixed-rates', 'data'),
+    State({'type': 'fixed-rate', 'index': ALL}, 'id'),
     State({'type': 'fixed-rate', 'index': ALL}, 'value'),
     prevent_initial_call=True
 )
-def set_fixed_rates_for_import(fixed_pairs, all_ids, current_value):
-    # fixed_pairs = [(index1, fixed_rate1), ...] from prev callback
+def set_fixed_rates_unified(import_pairs, psw_pairs, all_ids, current_values):
+    trig = ctx.triggered_id
+    if trig is None:
+        raise dash.exceptions.PreventUpdate
+
+    if trig == 'imported-fixed-rates':
+        fixed_pairs = import_pairs
+    elif trig == 'psw-fixed-rates':
+        fixed_pairs = psw_pairs
+    else:
+        fixed_pairs = None
+
     if not fixed_pairs or not all_ids:
         raise dash.exceptions.PreventUpdate
 
-    # Build map: index --> rate
     idx_to_rate = {idx: rate for idx, rate in (fixed_pairs or [])}
 
-    # Clone current vals, overlay where matches
-    values = list(current_value or [])
-
-    # Ensure output length matches number of inputs
+    values = list(current_values or [])
     if len(values) != len(all_ids):
         values = [None] * len(all_ids)
 
     for pos, cid in enumerate(all_ids):
-        try:
-            row_index = cid.get("index")
-            if row_index in idx_to_rate:
-                values[pos] = idx_to_rate[row_index]
-        except Exception:
-            # If can't parse, leave as is
-            pass
+        if isinstance(cid, dict):
+            idx = cid.get('index')
+            if idx in idx_to_rate:
+                values[pos] = idx_to_rate[idx]
 
     return values
+
+
+
+# # Set fixed-rate inputs for PSW rows
+# @callback(
+#     Output({'type': 'fixed-rate', "index": ALL}, 'value'),
+#     Input('psw-fixed-rates', 'data'),
+#     Input({'type': 'fixed-rate', 'index': ALL}, 'id'),
+#     State({'type': 'fixed-rate', 'index': ALL}, 'value'),
+#     prevent_initial_call=True
+# )
+# def set_fixed_rates_for_psw(fixed_pairs, all_ids, current_values):
+#     if not fixed_pairs or not all_ids:
+#         raise dash.exceptions.PreventUpdate
+#
+#     idx_to_rate = {idx: rate for idx, rate in (fixed_pairs or [])}
+#     values = list(current_values or [])
+#     if len(values) != len(all_ids):
+#         values = [None] * len(all_ids)
+#
+#     for pos, cid in enumerate(all_ids):
+#         if isinstance(cid, dict):
+#             idx = cid.get('index')
+#             if idx in idx_to_rate:
+#                 values[pos] = idx_to_rate[idx]
+#
+#     return values
+
+
+
+
+
+
+
+
+
+# N
+# --- PSW kick: flip fixed rows to variable to force render_rate_area to run once
+@callback(
+    Output({'type': 'loan-product', 'index': ALL}, 'value', allow_duplicate=True),
+    Output('psw-bounce-flag', 'data', allow_duplicate=True),
+    Input('psw-row-indices', 'data'),
+    State({'type': 'loan-product', 'index': ALL}, 'id'),
+    State({'type': 'loan-product', 'index': ALL}, 'value'),
+    State({'type': 'asset-type', 'index': ALL}, 'value'),
+    prevent_initial_call=True
+)
+def _psw_kick_products_to_variable(psw_indices, all_ids, current_products, asset_types):
+    if not psw_indices or not all_ids:
+        raise dash.exceptions.PreventUpdate
+
+    products = list(current_products or [])
+    if len(products) != len(all_ids):
+        products = [None] * len(all_ids)
+
+    psw_set = set(psw_indices)
+    for pos, cid in enumerate(all_ids):
+        try:
+            idx = cid.get('index')
+            if idx in psw_set:
+                at = (asset_types[pos] if pos < len(asset_types) else None)
+                products[pos] = 'variable_mortgage' if at == 'house' else 'variable_rate'
+        except Exception:
+            pass
+
+    return products, True
+
+
+# --- PSW bounce: flip those rows back to fixed so the UI shows the fixed-rate box
+@callback(
+    Output({'type': 'loan-product', 'index': ALL}, 'value', allow_duplicate=True),
+    Output('psw-bounce-flag', 'data', allow_duplicate=True),
+    Input('psw-bounce-flag', 'data'),
+    State('psw-row-indices', 'data'),
+    State({'type': 'loan-product', 'index': ALL}, 'id'),
+    State({'type': 'loan-product', 'index': ALL}, 'value'),
+    State({'type': 'asset-type', 'index': ALL}, 'value'),
+    prevent_initial_call=True
+)
+def _psw_bounce_back_to_fixed(need_bounce, psw_indices, all_ids, current_products, asset_types):
+    if not need_bounce or not psw_indices or not all_ids:
+        raise dash.exceptions.PreventUpdate
+
+    products = list(current_products or [])
+    if len(products) != len(all_ids):
+        products = [None] * len(all_ids)
+
+    psw_set = set(psw_indices)
+    for pos, cid in enumerate(all_ids):
+        try:
+            idx = cid.get('index')
+            if idx in psw_set:
+                at = (asset_types[pos] if pos < len(asset_types) else None)
+                products[pos] = 'fixed_mortgage' if at == 'house' else 'fixed_rate'
+        except Exception:
+            pass
+
+    return products, False
+
 
 
 
