@@ -3,3 +3,5 @@ gunicorn
 numpy
 numpy-financial
 matplotlib
+pandas
+openpyxl
